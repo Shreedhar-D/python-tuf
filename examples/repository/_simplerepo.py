@@ -1,14 +1,11 @@
-# Copyright 2021-2022 python-tuf contributors
-# SPDX-License-Identifier: MIT OR Apache-2.0
-
-"""Simple example of using the repository library to build a repository"""
+"""Example of using the repository library to build a repository"""
 
 import copy
 import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Union
+from typing import Union, Any, Optional
 
 from securesystemslib.signer import CryptoSigner, Key, Signer
 
@@ -40,33 +37,51 @@ _signed_init = {
 
 
 class SimpleRepository(Repository):
-    """Very simple in-memory repository implementation
-
-    This repository keeps the metadata for all versions of all roles in memory.
-    It also keeps all target content in memory.
-
+    """In-memory repository implementation with configurable parameters
 
     Attributes:
-        role_cache: Every historical metadata version of every role in this
-            repository. Keys are role names and values are lists of Metadata
-        signer_cache: All signers available to the repository. Keys are role
-            names, values are lists of signers
-        target_cache: All target files served by the repository. Keys are
-            target paths and values are file contents as bytes.
+        role_cache: Historical metadata versions for all roles
+        signer_cache: All signers available to the repository
+        target_cache: All target files served by the repository
+        _metrics: Internal metrics tracking for repository operations
     """
 
-    expiry_period = timedelta(days=1)
-
-    def __init__(self) -> None:
+    def __init__(
+        self, 
+        expiry_period: timedelta = timedelta(days=1),
+        default_targets_path: str = "*",
+        custom_logger: Optional[logging.Logger] = None
+    ) -> None:
+        """
+        Initialize the repository with configurable parameters
+        
+        Args:
+            expiry_period (timedelta): Period after which metadata expires
+            default_targets_path (str): Default path pattern for targets
+            custom_logger (logging.Logger, optional): Custom logger instance
+        """
+        # Configurable expiry period
+        self.expiry_period = expiry_period
+        self.default_targets_path = default_targets_path
+        
+        # Use provided logger or create a default one
+        self.logger = custom_logger or logger
+        
         # all versions of all metadata
         self.role_cache: dict[str, list[Metadata]] = defaultdict(list)
         # all current keys
         self.signer_cache: dict[str, list[Signer]] = defaultdict(list)
         # all target content
         self.target_cache: dict[str, bytes] = {}
+        
+        # Metrics tracking
+        self._metrics = {
+            'total_targets': 0,
+            'total_delegations': 0,
+            'metadata_versions': defaultdict(int)
+        }
+        
         # version cache for snapshot and all targets, updated in close().
-        # The 'defaultdict(lambda: ...)' trick allows close() to easily modify
-        # the version without always creating a new MetaFile
         self._snapshot_info = MetaFile(1)
         self._targets_infos: dict[str, MetaFile] = defaultdict(
             lambda: MetaFile(1)
@@ -82,6 +97,51 @@ class SimpleRepository(Repository):
         for role in ["timestamp", "snapshot", "targets"]:
             with self.edit(role):
                 pass
+
+    def _update_metrics(self, metric_type: str, value: Any = 1):
+        """Update internal metrics"""
+        if metric_type in self._metrics:
+            self._metrics[metric_type] += value
+
+    def get_repository_metrics(self) -> dict:
+        """
+        Retrieve repository performance and usage metrics
+        
+        Returns:
+            dict: Repository metrics
+        """
+        return {
+            'total_targets': self._metrics['total_targets'],
+            'total_delegations': self._metrics['total_delegations'],
+            'metadata_versions': dict(self._metrics['metadata_versions']),
+            'current_cache_sizes': {
+                'roles': len(self.role_cache),
+                'targets': len(self.target_cache),
+                'signers': len(self.signer_cache)
+            }
+        }
+
+    def validate_target_path(self, path: str) -> bool:
+        """
+        Validate and sanitize target path to prevent potential security issues
+        
+        Args:
+            path (str): Target path to validate
+        
+        Returns:
+            bool: Whether the path is valid
+        """
+        # Prevent directory traversal
+        if '..' in path or path.startswith('/'):
+            self.logger.warning(f"Potential directory traversal attempt: {path}")
+            return False
+        
+        # Optional: Add more sophisticated path validation
+        if len(path) > 255:
+            self.logger.warning(f"Target path too long: {path}")
+            return False
+        
+        return True
 
     @property
     def targets_infos(self) -> dict[str, MetaFile]:
@@ -114,7 +174,6 @@ class SimpleRepository(Repository):
         """Return current Metadata for role from 'storage'
         (or create a new one)
         """
-
         if role not in self.role_cache:
             signed_init = _signed_init.get(role, Targets)
             md = Metadata(signed_init())
@@ -141,7 +200,10 @@ class SimpleRepository(Repository):
             raise ValueError(f"Role {role} failed to verify")
         keyids = [keyid[:7] for keyid in vr.signed]
         verify_str = f"verified with keys [{', '.join(keyids)}]"
-        logger.debug("Role %s v%d: %s", role, md.signed.version, verify_str)
+        self.logger.debug("Role %s v%d: %s", role, md.signed.version, verify_str)
+
+        # Update metrics
+        self._metrics['metadata_versions'][role] += 1
 
         # store new metadata version, update version caches
         self.role_cache[role].append(md)
@@ -150,52 +212,101 @@ class SimpleRepository(Repository):
         elif role not in ["root", "timestamp"]:
             self._targets_infos[f"{role}.json"].version = md.signed.version
 
-    def add_target(self, path: str, content: str) -> None:
-        """Add a target to top-level targets metadata"""
-        data = bytes(content, "utf-8")
+    def add_target(self, path: str, content: str) -> bool:
+        """Enhanced add_target with additional validations"""
+        if not self.validate_target_path(path):
+            self.logger.error(f"Invalid target path: {path}")
+            return False
+        
+        try:
+            data = bytes(content, "utf-8")
+            
+            # Additional optional content validation
+            if len(data) > 10 * 1024 * 1024:  # 10 MB limit
+                self.logger.warning(f"Target content exceeds size limit: {path}")
+                return False
+            
+            # Add content to cache for serving to clients
+            self.target_cache[path] = data
 
-        # add content to cache for serving to clients
-        self.target_cache[path] = data
+            # Add a target in the targets metadata
+            with self.edit_targets() as targets:
+                targets.targets[path] = TargetFile.from_data(path, data)
 
-        # add a target in the targets metadata
-        with self.edit_targets() as targets:
-            targets.targets[path] = TargetFile.from_data(path, data)
+            # Update metrics
+            self._update_metrics('total_targets')
 
-        # update snapshot, timestamp
-        self.do_snapshot()
-        self.do_timestamp()
+            # Update snapshot, timestamp
+            self.do_snapshot()
+            self.do_timestamp()
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to add target {path}: {e}")
+            return False
 
     def submit_delegation(self, rolename: str, data: bytes) -> bool:
         """Add a delegation to a (offline signed) delegated targets metadata"""
         try:
-            logger.debug("Processing new delegation to role %s", rolename)
-            keyid, keydict = next(iter(json.loads(data).items()))
-            key = Key.from_dict(keyid, keydict)
+            # More robust error handling and logging
+            if not data:
+                self.logger.error(f"Empty delegation data for role {rolename}")
+                return False
 
-            # add delegation and key
-            role = DelegatedRole(rolename, [], 1, True, [f"{rolename}/*"])
-            with self.edit_targets() as targets:
-                if targets.delegations is None:
-                    targets.delegations = Delegations({}, {})
-                if targets.delegations.roles is None:
-                    targets.delegations.roles = {}
-                targets.delegations.roles[rolename] = role
-                targets.add_key(key, rolename)
+            try:
+                delegation_data = json.loads(data)
+                if not delegation_data:
+                    self.logger.warning(f"No key information in delegation for role {rolename}")
+                    return False
+            except json.JSONDecodeError as json_error:
+                self.logger.error(f"Invalid JSON in delegation for {rolename}: {json_error}")
+                return False
 
-        except (RepositoryError, json.JSONDecodeError) as e:
-            logger.info("Failed to add delegation for %s: %s", rolename, e)
+            # Existing logic with improved error handling
+            try:
+                keyid, keydict = next(iter(delegation_data.items()))
+                key = Key.from_dict(keyid, keydict)
+
+                # Add delegation and key
+                role = DelegatedRole(rolename, [], 1, True, [f"{rolename}/*"])
+                with self.edit_targets() as targets:
+                    if targets.delegations is None:
+                        targets.delegations = Delegations({}, {})
+                    if targets.delegations.roles is None:
+                        targets.delegations.roles = {}
+                    
+                    # Check for existing role before adding
+                    if rolename in targets.delegations.roles:
+                        self.logger.warning(f"Delegation for role {rolename} already exists. Overwriting.")
+                    
+                    targets.delegations.roles[rolename] = role
+                    targets.add_key(key, rolename)
+
+            except (RepositoryError, KeyError) as e:
+                self.logger.error(f"Failed to process delegation for {rolename}: {e}")
+                return False
+
+        except Exception as unexpected_error:
+            self.logger.critical(f"Unexpected error in submit_delegation: {unexpected_error}")
             return False
 
-        # update snapshot, timestamp
-        self.do_snapshot()
-        self.do_timestamp()
+        # Update metrics
+        self._update_metrics('total_delegations')
+
+        # Update snapshot and timestamp
+        try:
+            self.do_snapshot()
+            self.do_timestamp()
+        except Exception as update_error:
+            self.logger.error(f"Failed to update snapshot/timestamp after delegation: {update_error}")
+            return False
 
         return True
 
     def submit_role(self, role: str, data: bytes) -> bool:
         """Add a new version of a delegated roles metadata"""
         try:
-            logger.debug("Processing new version for role %s", role)
+            self.logger.debug("Processing new version for role %s", role)
             if role in ["root", "snapshot", "timestamp", "targets"]:
                 raise ValueError("Only delegated targets are accepted")
 
@@ -205,21 +316,21 @@ class SimpleRepository(Repository):
                     raise ValueError(f"targets allowed under {role}/ only")
 
             if md.signed.version != self.targets(role).version + 1:
-                raise ValueError("Invalid version {md.signed.version}")
+                raise ValueError(f"Invalid version {md.signed.version}")
 
         except (RepositoryError, ValueError) as e:
-            logger.info("Failed to add new version for %s: %s", role, e)
+            self.logger.info("Failed to add new version for %s: %s", role, e)
             return False
 
         # Check that we only write verified metadata
         vr = self._get_verification_result(role, md)
         if not vr:
-            logger.info("Role %s failed to verify", role)
+            self.logger.info("Role %s failed to verify", role)
             return False
 
         keyids = [keyid[:7] for keyid in vr.signed]
         verify_str = f"verified with keys [{', '.join(keyids)}]"
-        logger.debug("Role %s v%d: %s", role, md.signed.version, verify_str)
+        self.logger.debug("Role %s v%d: %s", role, md.signed.version, verify_str)
 
         # Checks passed: Add new delegated role version
         self.role_cache[role].append(md)
@@ -229,7 +340,10 @@ class SimpleRepository(Repository):
         for targetpath in md.signed.targets:
             self.target_cache[targetpath] = bytes(f"{targetpath}", "utf-8")
 
-        # update snapshot, timestamp
+        # Update metrics
+        self._metrics['metadata_versions'][role] += 1
+
+        # Update snapshot, timestamp
         self.do_snapshot()
         self.do_timestamp()
 
